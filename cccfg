@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""cccfg - Claude Code agent 配置快捷工具.
+
+只读默认值: `cccfg` == `cccfg show`. 任何写操作都会先生成
+`<文件名>.bak-YYYYMMDD-HHMMSS` 备份.
+
+预设里用 $OPUS / $SONNET / $FAST 之类的语义别名, 实际模型 id 由
+`~/.claude/cccfg-aliases.json` 提供 (该文件不入库)。这样同一套预设
+可以在任意网关 / 任意模型列表下复用, 也不必公开任何私有模型命名。
+
+环境变量:
+  CCCFG_ROOT   配置根目录, 默认 ~/.claude (测试时可指向临时目录)
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(os.environ.get("CCCFG_ROOT", Path.home() / ".claude")).expanduser()
+AGENTS_DIR = ROOT / "agents"
+SETTINGS = ROOT / "settings.json"
+PRESETS = ROOT / "cccfg-presets.json"
+ALIASES = ROOT / "cccfg-aliases.json"
+EFFORTS = ("low", "medium", "high")
+
+
+# --------------------------------------------------------------------------
+# 模型语义别名: 预设里写 $NAME, 真实 id 留在不入库的本地文件里
+# --------------------------------------------------------------------------
+
+def load_aliases():
+    if not ALIASES.exists():
+        return {}
+    try:
+        return json.loads(ALIASES.read_text(encoding="utf-8")).get("aliases", {})
+    except Exception:
+        return {}
+
+
+def resolve_model(value, strict=True):
+    if not isinstance(value, str) or not value.startswith("$"):
+        return value
+    key = value[1:]
+    table = load_aliases()
+    val = table.get(key)
+    if not val or "REPLACE_WITH" in val:
+        if not strict:
+            return value
+        raise RuntimeError(
+            f"模型别名 ${key} 未配置。请把 cccfg-aliases.example.json 复制为 "
+            f"{ALIASES} 并填入你自己的模型 id (取自 settings.json 的 modelPicker.options[].model)")
+    return val
+
+
+# --------------------------------------------------------------------------
+# 基础读写
+# --------------------------------------------------------------------------
+
+def ts():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def backup(path):
+    """复制一份带时间戳的备份, 同名时追加序号."""
+    dst = path.with_name(f"{path.name}.bak-{ts()}")
+    n = 1
+    while dst.exists():
+        dst = path.with_name(f"{path.name}.bak-{ts()}-{n}")
+        n += 1
+    shutil.copy2(path, dst)
+    return dst
+
+
+def agent_files():
+    if not AGENTS_DIR.is_dir():
+        return {}
+    out = {}
+    for p in sorted(AGENTS_DIR.glob("*.md")):
+        if ".bak" in p.name:
+            continue
+        out[p.stem] = p
+    return out
+
+
+def parse_frontmatter(path):
+    """返回 (fields, end_index, lines). fields: key -> (value, line_index)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, None, lines
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return None, None, lines
+    fields = {}
+    for i in range(1, end):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$", lines[i])
+        if m:
+            fields[m.group(1)] = (m.group(2).strip(), i)
+    return fields, end, lines
+
+
+def agent_state():
+    state = {}
+    for name, path in agent_files().items():
+        fields, end, _ = parse_frontmatter(path)
+        if fields is None:
+            state[name] = {"model": "?", "effort": "-", "_broken": True}
+            continue
+        state[name] = {
+            "model": fields.get("model", ("inherit",))[0],
+            "effort": fields.get("effort", ("-",))[0],
+            "_broken": False,
+        }
+    return state
+
+
+def set_frontmatter_fields(path, changes, dry=False):
+    """一次写入多个字段, 只做一份备份, 避免 rollback 落到中间态."""
+    fields, end, lines = parse_frontmatter(path)
+    if fields is None:
+        raise RuntimeError(f"{path.name} 的 frontmatter 无法解析, 已拒绝修改")
+    for key, value in changes.items():
+        if key in fields:
+            lines[fields[key][1]] = f"{key}: {value}"
+        else:
+            lines.insert(end, f"{key}: {value}")
+            end += 1
+    text = "\n".join(lines) + "\n"
+    if dry:
+        return text
+    b = backup(path)
+    path.write_text(text, encoding="utf-8")
+    return b
+
+
+def set_frontmatter_field(path, key, value, dry=False):
+    return set_frontmatter_fields(path, {key: value}, dry=dry)
+
+
+# --- settings.json: 用锚定缩进的文本替换, 不重排整个文件 ---
+
+# 三组: (前缀含左引号, 值, 右引号). 缩进锚定保证只命中顶层键,
+# 不会误伤 modelPicker.options 里的 "model": ...
+SETTING_PATTERNS = {
+    "concurrency": r'^(\s{4}"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"\s*:\s*")([^"]*)(")',
+    "effortLevel": r'^(\s{2}"effortLevel"\s*:\s*")([^"]*)(")',
+    "model": r'^(\s{2}"model"\s*:\s*")([^"]*)(")',
+}
+
+
+def settings_value(key):
+    txt = SETTINGS.read_text(encoding="utf-8")
+    m = re.search(SETTING_PATTERNS[key], txt, re.M)
+    return m.group(2) if m else None
+
+
+def settings_text():
+    return SETTINGS.read_text(encoding="utf-8")
+
+
+def edit_settings(changes, dry=False):
+    """changes: {key: value}. value 为 None 表示删除该顶层键."""
+    txt = settings_text()
+    for key, value in changes.items():
+        pat = SETTING_PATTERNS[key]
+        if re.search(pat, txt, re.M):
+            if value is None:
+                txt = re.sub(pat + r"\s*,?\n", "", txt, count=1, flags=re.M)
+            else:
+                txt = re.sub(pat, lambda m: m.group(1) + str(value) + m.group(3),
+                             txt, count=1, flags=re.M)
+        elif value is not None:
+            # 顶层键不存在: 插到第一个 { 后面
+            line = {
+                "model": f'  "model": "{value}",',
+                "effortLevel": f'  "effortLevel": "{value}",',
+                "concurrency": f'  "env": {{"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "{value}"}},',
+            }[key]
+            txt = txt.replace("{\n", "{\n" + line + "\n", 1)
+    # 写盘前先确保仍然是合法 JSON, 绝不把 settings.json 改坏
+    json.loads(txt)
+    if dry:
+        return txt
+    b = backup(SETTINGS)
+    SETTINGS.write_text(txt, encoding="utf-8")
+    return b
+
+
+def valid_models():
+    models = {"inherit"}
+    try:
+        d = json.loads(settings_text())
+        for o in d.get("modelPicker", {}).get("options", []):
+            if o.get("model"):
+                models.add(o["model"])
+    except Exception:
+        pass
+    return models
+
+
+# --------------------------------------------------------------------------
+# 展示 / 校验
+# --------------------------------------------------------------------------
+
+def cmd_show(args):
+    state = agent_state()
+    print("Claude Code 配置  ·  " + str(ROOT))
+    print("-" * 68)
+    print(f"{'AGENT':<16}{'MODEL':<32}{'EFFORT':<9}TOOLS")
+    for name, s in state.items():
+        fields, _, _ = parse_frontmatter(agent_files()[name])
+        tools = fields.get("tools", ("",))[0] if fields else ""
+        tools = tools.replace(", ", ",")[:28]
+        flag = "  <- frontmatter 异常" if s["_broken"] else ""
+        print(f"{name:<16}{s['model']:<32}{s['effort']:<9}{tools}{flag}")
+    print("-" * 68)
+    print(f"{'主模型(model)':<16}{settings_value('model') or '未固定 (跟随 /model)'}")
+    print(f"{'全局 effort':<16}{settings_value('effortLevel') or '未设置'}")
+    print(f"{'子代理并发':<16}{settings_value('concurrency') or '未设置'}")
+    print(f"{'模型选择器':<16}{len(valid_models()) - 1} 个可用 id")
+    print()
+    print("检查配置问题: cccfg check     列出预设: cccfg presets")
+    return 0
+
+
+def cmd_check(args):
+    state = agent_state()
+    problems, notes = [], []
+    models = valid_models()
+
+    for name, s in state.items():
+        path = agent_files()[name]
+        fields, end, lines = parse_frontmatter(path)
+        if fields is None:
+            problems.append(f"{name}: frontmatter 缺失或没有闭合的 ---")
+            continue
+        # 未加引号的 plain scalar 里出现 ": " 会让 YAML 解析失败
+        for i in range(1, end):
+            m = re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:\s*(\S.*)$", lines[i])
+            if m and not m.group(1).startswith(('"', "'", "{", "[")) and ": " in m.group(1):
+                problems.append(f"{name}: 第 {i+1} 行含未转义的 ': ', YAML 会解析失败并静默丢掉 model")
+        if s["model"] != "?" and s["model"] not in models and not s["model"].startswith("claude-"):
+            near = difflib.get_close_matches(s["model"], models, n=1, cutoff=0.75)
+            hint = f" (是不是想写 {near[0]}?)" if near else ""
+            notes.append(f"{name}: '{s['model']}' 不在 modelPicker 里{hint}")
+        if s["effort"] not in EFFORTS + ("-",):
+            problems.append(f"{name}: effort='{s['effort']}' 不是 low/medium/high")
+
+    if not ALIASES.exists():
+        notes.append("未找到 cccfg-aliases.json: 预设里的 $别名 还不能应用, 请按 example 文件配置")
+    else:
+        bad = [k for k, v in load_aliases().items() if not v or "REPLACE_WITH" in str(v)]
+        if bad:
+            notes.append(f"模型别名仍是占位值: {', '.join(bad)}")
+
+    if "planner" in state and state["planner"]["model"] == "inherit":
+        notes.append("planner 用 inherit: 会跟着主模型漂移, 建议显式钉死")
+    if "builder" in state and "code-reviewer" in state:
+        if state["builder"]["model"] == state["code-reviewer"]["model"]:
+            notes.append("builder 与 code-reviewer 同模型: 自审盲区相关性高, 建议换强度或换家族")
+    if "builder" in state and "verifier" in state:
+        rank = {e: i for i, e in enumerate(EFFORTS)}
+        b = rank.get(state["builder"]["effort"], 1)
+        v = rank.get(state["verifier"]["effort"], 1)
+        if v > b:
+            notes.append("verifier 的 effort 高于 builder: 写代码的比跑测试的还省, 成本倒挂")
+    try:
+        n = int(settings_value("concurrency") or 0)
+        if n > 6:
+            notes.append(f"子代理并发 {n} 偏高: 多个高价值模型角色并行时容易撞限流、撑大主上下文")
+    except ValueError:
+        pass
+    if settings_value("effortLevel") == "high":
+        notes.append("全局 effortLevel=high: 日常简单对话也会走高强度思考")
+
+    print("配置校验  ·  " + str(ROOT))
+    print("-" * 68)
+    if problems:
+        for p in problems:
+            print("  [错误] " + p)
+    else:
+        print("  [通过] frontmatter 均可解析, effort 取值合法")
+    for n in notes:
+        print("  [提示] " + n)
+    if not notes:
+        print("  [通过] 未发现已知的配置反模式")
+    print(f"\n  {len(problems)} 个错误, {len(notes)} 条提示")
+    return 1 if problems else 0
+
+
+# --------------------------------------------------------------------------
+# 预设
+# --------------------------------------------------------------------------
+
+def load_presets():
+    if not PRESETS.exists():
+        return {"presets": {}}
+    return json.loads(PRESETS.read_text(encoding="utf-8"))
+
+
+def resolved_preset(p, strict=True):
+    """把预设里的 $ALIAS 展开成本地 aliases 文件里的真实模型 id."""
+    out = {"desc": p.get("desc", ""),
+           "agents": {}, "settings": dict(p.get("settings", {}))}
+    for a, cfg in p.get("agents", {}).items():
+        c = dict(cfg)
+        if "model" in c:
+            c["model"] = resolve_model(c["model"], strict=strict)
+        out["agents"][a] = c
+    return out
+
+
+def cmd_presets(args):
+    data = load_presets()
+    print("预设  ·  " + str(PRESETS))
+    print("-" * 68)
+    for name, p in data.get("presets", {}).items():
+        print(f"  {name:<12} {p.get('desc', '')}")
+        for a, cfg in p.get("agents", {}).items():
+            m = cfg.get("model", "")
+            shown = resolve_model(m, strict=False)
+            if shown != m:
+                shown = f"{m} = {shown}"
+            print(f"      {a:<15} {shown:<30} effort={cfg.get('effort','保持')}")
+        s = p.get("settings", {})
+        if s:
+            print(f"      {'全局':<15} 并发={s.get('concurrency','保持')}  effort={s.get('effortLevel','保持')}")
+        print()
+    print("应用: cccfg preset <名字> [--dry-run]    保存当前配置: cccfg save <名字>")
+    return 0
+
+
+def cmd_preset(args):
+    data = load_presets()
+    raw = data.get("presets", {}).get(args.name)
+    if not raw:
+        print(f"没有预设 '{args.name}'。可选: {', '.join(data.get('presets', {}))}", file=sys.stderr)
+        return 2
+    p = resolved_preset(raw, strict=not args.dry_run)
+    available = agent_files()
+    print(f"应用预设: {args.name} — {p.get('desc','')}")
+    for a, cfg in p.get("agents", {}).items():
+        if a not in available:
+            print(f"  [跳过] 找不到 agent: {a}")
+            continue
+        for k in ("model", "effort"):
+            if k in cfg:
+                print(f"  {a:<16} {k:<7} -> {cfg[k]}")
+    for k, v in p.get("settings", {}).items():
+        print(f"  {'settings':<16} {k:<7} -> {v}")
+    print("  注: 预设不改动主模型(model), 主模型请用 cccfg main 或会话内 /model")
+    if args.dry_run:
+        if not ALIASES.exists():
+            print("\n  提示: 尚未创建 cccfg-aliases.json, 上面显示的是语义别名;")
+            print("        实际应用前请按 cccfg-aliases.example.json 配置你自己的模型 id。")
+        print("\n[DRY-RUN] 未写入任何文件")
+        return 0
+    current = agent_state()
+    for a, cfg in p.get("agents", {}).items():
+        if a not in available:
+            continue
+        changes = {k: cfg[k] for k in ("model", "effort")
+                   if k in cfg and current.get(a, {}).get(k) != cfg[k]}
+        if not changes:
+            print(f"  {a:<16} 无需改动")
+            continue
+        print(f"  写入 {a:<16} {changes} -> {set_frontmatter_fields(available[a], changes)}")
+    s = {k: str(v) for k, v in p.get("settings", {}).items()
+         if settings_value(k) != str(v)}
+    if s:
+        print(f"  写入 settings.json … {edit_settings(s)}")
+    print("\n完成。注意: 已在运行的 subagent 不受影响, 新 spawn 的才加载新配置。")
+    return 0
+
+
+def cmd_save(args):
+    data = load_presets()
+    data.setdefault("presets", {})
+    state = agent_state()
+    agents = {}
+    for name, s in state.items():
+        agents[name] = {"model": s["model"]}
+        if s["effort"] in EFFORTS:
+            agents[name]["effort"] = s["effort"]
+    settings = {}
+    for k in ("concurrency", "effortLevel"):
+        v = settings_value(k)
+        if v:
+            settings[k] = v
+    data["presets"][args.name] = {
+        "desc": args.desc or f"用户快照 {ts()}",
+        "agents": agents,
+        "settings": settings,
+    }
+    if PRESETS.exists():
+        print("  备份 " + str(backup(PRESETS)))
+    PRESETS.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"已保存当前配置为预设 '{args.name}' -> {PRESETS}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 单项设置
+# --------------------------------------------------------------------------
+
+def resolve_agent(name):
+    files = agent_files()
+    if name in files:
+        return name, files[name]
+    m = difflib.get_close_matches(name, files, n=1, cutoff=0.5)
+    hint = f" (是不是想写 {m[0]}?)" if m else ""
+    raise RuntimeError(f"找不到 agent '{name}'{hint}")
+
+
+def cmd_set(args):
+    name, path = resolve_agent(args.agent)
+    model = resolve_model(args.model, strict=not args.dry_run)
+    models = valid_models()
+    if model not in models and not model.startswith(("claude-", "$")):
+        near = difflib.get_close_matches(model, models, n=3, cutoff=0.5)
+        print(f"警告: '{model}' 不在 modelPicker 中。相近: {near or '无'}", file=sys.stderr)
+    print(f"  {name}: model -> {model}")
+    if args.dry_run:
+        print("[DRY-RUN] 未写入")
+        return 0
+    print("  备份 " + str(set_frontmatter_field(path, "model", model)))
+    return 0
+
+
+def cmd_effort(args):
+    name, path = resolve_agent(args.agent)
+    if args.level not in EFFORTS:
+        print(f"effort 只能是 {EFFORTS}", file=sys.stderr)
+        return 2
+    print(f"  {name}: effort -> {args.level}")
+    if args.dry_run:
+        print("[DRY-RUN] 未写入")
+        return 0
+    print("  备份 " + str(set_frontmatter_field(path, "effort", args.level)))
+    return 0
+
+
+def cmd_concurrency(args):
+    if not args.n.isdigit() or int(args.n) < 1:
+        print("并发必须是正整数", file=sys.stderr)
+        return 2
+    print(f"  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS -> {args.n}")
+    if args.dry_run:
+        print("[DRY-RUN] 未写入")
+        return 0
+    print("  备份 " + str(edit_settings({"concurrency": args.n})))
+    return 0
+
+
+def cmd_global_effort(args):
+    if args.level not in EFFORTS:
+        print(f"effort 只能是 {EFFORTS}", file=sys.stderr)
+        return 2
+    print(f"  effortLevel -> {args.level}")
+    if args.dry_run:
+        print("[DRY-RUN] 未写入")
+        return 0
+    print("  备份 " + str(edit_settings({"effortLevel": args.level})))
+    return 0
+
+
+def cmd_main(args):
+    value = None if args.model == "unset" else resolve_model(args.model, strict=not args.dry_run)
+    if value and value not in valid_models() and not value.startswith(("claude-", "$")):
+        print(f"警告: '{value}' 不在 modelPicker 中", file=sys.stderr)
+    print(f"  settings.json model -> {value or '删除 (交回 /model 管理)'}")
+    if args.dry_run:
+        print("[DRY-RUN] 未写入")
+        return 0
+    print("  备份 " + str(edit_settings({"model": value})))
+    print("  注意: model 只在 Claude Code 启动时读取, 重开会话才生效")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 对比 / 回滚
+# --------------------------------------------------------------------------
+
+def resolve_file(spec):
+    p = ROOT / spec
+    if p.exists():
+        return p
+    matches = list(ROOT.glob(spec + "*"))
+    if len(matches) == 1:
+        return matches[0]
+    raise RuntimeError(f"找不到文件: {spec} (匹配到 {len(matches)} 个)")
+
+
+def latest_backup(path):
+    baks = sorted(path.parent.glob(path.name + ".bak-*"),
+                  key=lambda p: (p.stat().st_mtime, p.name))
+    if not baks:
+        raise RuntimeError(f"{path.name} 没有备份")
+    return baks[-1]
+
+
+def cmd_diff(args):
+    target = resolve_file(args.file)
+    bak = latest_backup(target)
+    print(f"对比: {bak.name}  ->  {target.name}")
+    d = list(difflib.unified_diff(
+        bak.read_text(encoding="utf-8").splitlines(),
+        target.read_text(encoding="utf-8").splitlines(),
+        fromfile=bak.name, tofile=target.name, lineterm=""))
+    print("\n".join(d) if d else "  (无差异)")
+    return 0
+
+
+def cmd_rollback(args):
+    target = resolve_file(args.file)
+    bak = latest_backup(target)
+    if not args.dry_run:
+        print("  先备份当前 " + str(backup(target)))
+        shutil.copy2(bak, target)
+        print(f"  已从 {bak.name} 恢复 {target.name}")
+    else:
+        print(f"[DRY-RUN] 将用 {bak.name} 覆盖 {target.name}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    epilog = """\
+安装:
+  ./install.sh
+  cp ~/.claude/cccfg-aliases.example.json ~/.claude/cccfg-aliases.json
+  # 编辑该文件, 把值换成 settings.json 里 modelPicker.options[].model 的 id
+
+常用:
+  cccfg                               查看当前配置 (只读)
+  cccfg check                         校验并列出配置反模式
+  cccfg presets                       列出预设
+  cccfg preset balanced --dry-run     预览改动, 不写文件
+  cccfg preset balanced               应用「均衡」预设
+  cccfg set builder '$OPUS'           单独改模型 (支持 $别名)
+  cccfg effort verifier medium        单独改 effort
+  cccfg concurrency 5                 改子代理并发
+  cccfg main '$OPUS'                  固定默认主模型 (unset 可撤销)
+  cccfg save my-snapshot              把当前配置存成新预设
+  cccfg diff agents/verifier.md       与最近一次备份对比
+  cccfg rollback agents/verifier.md   回滚
+
+任何写操作都会自动生成 .bak-YYYYMMDD-HHMMSS 备份, 且支持 --dry-run。
+agent 的模型在 spawn 时锁定: 改动只对之后新建的 subagent 生效。
+"""
+    ap = argparse.ArgumentParser(
+        prog="cccfg", description="Claude Code agent 配置快捷工具 (默认只读展示)",
+        epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def add(name, func, *specs, dry=True):
+        p = sub.add_parser(name)
+        for args, kw in specs:
+            p.add_argument(*args, **kw)
+        if dry:
+            p.add_argument("--dry-run", action="store_true", help="只预览, 不写文件")
+        p.set_defaults(func=func)
+        return p
+
+    add("show", cmd_show, dry=False)
+    add("check", cmd_check, dry=False)
+    add("presets", cmd_presets, dry=False)
+    add("preset", cmd_preset, (("name",), {"help": "预设名"}))
+    add("save", cmd_save, (("name",), {"help": "快照名"}),
+        (("--desc",), {"default": "", "help": "说明文字"}), dry=False)
+    add("set", cmd_set, (("agent",), {"help": "agent 名"}), (("model",), {"help": "模型 id"}))
+    add("effort", cmd_effort, (("agent",), {"help": "agent 名"}),
+        (("level",), {"help": "low/medium/high"}))
+    add("concurrency", cmd_concurrency, (("n",), {"help": "并发数"}))
+    add("global-effort", cmd_global_effort, (("level",), {"help": "low/medium/high"}))
+    add("main", cmd_main, (("model",), {"help": "主模型 id, 或 unset 交回 /model"}))
+    add("diff", cmd_diff, (("file",), {"help": "相对 ~/.claude 的路径"}), dry=False)
+    add("rollback", cmd_rollback, (("file",), {"help": "相对 ~/.claude 的路径"}))
+
+    args = ap.parse_args()
+    if not args.cmd:
+        args.func = cmd_show
+        args = argparse.Namespace(cmd="show", func=cmd_show)
+    if not SETTINGS.exists():
+        print(f"找不到 {SETTINGS}", file=sys.stderr)
+        return 2
+    try:
+        return args.func(args)
+    except (RuntimeError, OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

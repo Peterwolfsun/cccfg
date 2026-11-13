@@ -1,0 +1,92 @@
+{
+  "_说明": "模型用 $语义别名 表示，真实 id 放在不入库的 ~/.claude/cccfg-aliases.json 里。预设只改列出的字段，未列出的保持原样；预设故意不改主模型 model（由 /model 或 cccfg main 管）。",
+  "presets": {
+    "balanced": {
+      "desc": "均衡日常：规划和评审用强模型，机械活用快模型，成本与并发都收紧",
+      "agents": {
+        "Explore": {
+          "model": "$FAST_1M",
+          "effort": "low"
+        },
+        "builder": {
+          "model": "$SONNET",
+          "effort": "medium"
+        },
+        "code-reviewer": {
+          "model": "$OPUS",
+          "effort": "high"
+        },
+        "planner": {
+          "model": "$OPUS",
+          "effort": "high"
+        },
+        "verifier": {
+          "model": "$SONNET",
+          "effort": "medium"
+        }
+      },
+      "settings": {
+        "concurrency": "5",
+        "effortLevel": "medium"
+      }
+    },
+    "quality": {
+      "desc": "质量优先：实现也用强模型，评审换异构家族做交叉评审，并发收紧",
+      "agents": {
+        "Explore": {
+          "model": "$FAST_1M",
+          "effort": "low"
+        },
+        "builder": {
+          "model": "$OPUS",
+          "effort": "high"
+        },
+        "code-reviewer": {
+          "model": "$CROSS_FAMILY",
+          "effort": "high"
+        },
+        "planner": {
+          "model": "$OPUS",
+          "effort": "high"
+        },
+        "verifier": {
+          "model": "$SONNET",
+          "effort": "medium"
+        }
+      },
+      "settings": {
+        "concurrency": "4",
+        "effortLevel": "high"
+      }
+    },
+    "cheap": {
+      "desc": "省 token / 求快：机械活全用快模型，主对话降 effort，评审仍留强模型兜底",
+      "agents": {
+        "Explore": {
+          "model": "$FAST",
+          "effort": "low"
+        },
+        "builder": {
+          "model": "$SONNET",
+          "effort": "medium"
+        },
+        "code-reviewer": {
+          "model": "$OPUS",
+          "effort": "medium"
+        },
+        "planner": {
+          "model": "$SONNET",
+          "effort": "medium"
+        },
+        "verifier": {
+          "model": "$FAST",
+          "effort": "medium"
+        }
+      },
+      "settings": {
+        "concurrency": "3",
+        "effortLevel": "low"
+      }
+    }
+  }
+}

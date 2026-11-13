@@ -1,0 +1,10 @@
+{
+  "_说明": "复制本文件为 ~/.claude/cccfg-aliases.json，把每个值改成你自己 settings.json 里 modelPicker.options[].model 的实际 id。cccfg-aliases.json 已被 .gitignore 忽略，不会进仓库，所以私有模型命名不会外泄。",
+  "aliases": {
+    "OPUS": "REPLACE_WITH_YOUR_STRONGEST_MODEL_ID",
+    "SONNET": "REPLACE_WITH_YOUR_MID_TIER_MODEL_ID",
+    "FAST": "REPLACE_WITH_YOUR_FAST_MODEL_ID",
+    "FAST_1M": "REPLACE_WITH_YOUR_LONG_CONTEXT_FAST_MODEL_ID",
+    "CROSS_FAMILY": "REPLACE_WITH_A_MODEL_ID_FROM_A_DIFFERENT_FAMILY"
+  }
+}
